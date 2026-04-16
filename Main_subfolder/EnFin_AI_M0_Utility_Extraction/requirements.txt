@@ -1,0 +1,22 @@
+# AWS SDK
+boto3
+
+# PDF Processing
+PyMuPDF==1.27.2.2
+
+# Image Processing
+Pillow
+
+# Data handling
+pydantic==2.12.5
+
+# HTTP requests (Salesforce)
+requests==2.32.5
+
+# Document text extraction (Docling)
+docling==2.81.0
+easyocr==1.7.2
+
+# RapidOCR (alternative OCR engine, configurable via OCR_ENGINE env var)
+rapidocr==3.7.0
+rapidocr-onnxruntime==1.2.3
