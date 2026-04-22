@@ -1,0 +1,844 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Configurable Document Extraction Lambda — Docling + LLM (Bedrock Converse API).
+  Triggered by input SQS FIFO, processes files individually, stores results in
+  DynamoDB, and pushes to Salesforce immediately per file.
+
+# ============================================================================
+# Parameters — all values configurable via deployment overrides
+# ============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: Dev
+    AllowedValues: [Dev-v1, Dev, Prod]
+    Description: Environment name
+
+  S3BucketName:
+    Type: String
+    Description: S3 bucket containing source documents
+
+  # Confidence thresholds (0-1 scale)
+  AutoAcceptThreshold:
+    Type: String
+    Default: "0.95"
+    Description: Confidence threshold for auto-accept
+
+  FlagThreshold:
+    Type: String
+    Default: "0.80"
+    Description: Confidence threshold for flagging review
+
+  # Model configuration
+  ExtractionModel:
+    Type: String
+    Default: "us.meta.llama4-maverick-17b-instruct-v1:0"
+    Description: Bedrock model ID for extraction
+  # BDA  arn
+  BDAProfileArn:
+    Type: String
+    Default: "arn:aws:bedrock:us-west-2:673522932440:data-automation-profile/us.data-automation-v1"
+    Description: Bedrock Data Automation profile ARN
+    
+  ModelMaxTokens:
+    Type: String
+    Default: "4096"
+    Description: Maximum tokens for LLM response
+
+  ModelTemperature:
+    Type: String
+    Default: "0.1"
+    Description: LLM temperature
+
+  MaxImagesPerLLMCall:
+    Type: String
+    Default: "3"
+    Description: Max images per Converse API call
+
+  # OCR configuration
+  OCREngine:
+    Type: String
+    Default: "easyocr"
+    AllowedValues: [easyocr, rapidocr]
+    Description: OCR engine for Docling
+
+  OCRLang:
+    Type: String
+    Default: "en"
+    Description: Comma-separated OCR language codes
+
+  ForceOCR:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Force OCR on every page
+
+  # Image processing
+  PDFImageDPI:
+    Type: String
+    Default: "150"
+    Description: DPI for PDF page rendering
+
+  MaxImageDimension:
+    Type: String
+    Default: "2000"
+    Description: Max pixel dimension for page images
+
+  # Config cache
+  ConfigCacheTTLSeconds:
+    Type: String
+    Default: "300"
+    Description: DynamoDB config cache TTL in seconds
+
+  # Salesforce configuration
+  SalesforceEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable Salesforce integration in aggregator
+
+  SalesforceTokenTableName:
+    Type: String
+    Default: ""
+    Description: DynamoDB table for SF token management
+
+  SalesforceHost:
+    Type: String
+    Default: ""
+    Description: Salesforce host URL
+
+  SalesforceInstanceUrl:
+    Type: String
+    Default: ""
+    Description: Salesforce instance URL
+
+  SalesforceUsername:
+    Type: String
+    Default: ""
+    Description: Salesforce integration username
+
+  SalesforceSecretName:
+    Type: String
+    Default: ""
+    Description: Secrets Manager secret for SF credentials
+
+  SalesforceApexPath:
+    Type: String
+    Default: ""
+    Description: Salesforce Apex REST endpoint path
+
+  SalesforceDiffTime:
+    Type: String
+    Default: ""
+    Description: Salesforce token difference time
+
+  SalesforceAuthPath:
+    Type: String
+    Default: ""
+    Description: Salesforce Auth Token Path
+
+  # Timezone & Timestamp
+  Timezone:
+    Type: String
+    Default: "US/Pacific"
+    Description: Timezone for timestamps
+
+  TimestampFormat:
+    Type: String
+    Default: "%m-%d-%Y"
+    Description: Timestamp format string (Python strftime)
+
+  # Logging
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+    Description: Application log level
+
+  NomalizationRuleReplacements:
+    Type: String
+    Default: '{" ": "","-": "","&amp;": "&"}'
+    Description: Comma-separated character replacements for normalization (e.g. " ,-,.,/,\\") — pairs of characters to replace and their replacements defined in code
+
+  # Aggregation layer
+  AggregationEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable aggregation layer (delayed SQS trigger for cross-file aggregation)
+
+Globals:
+  Function:
+    Timeout: 600
+    MemorySize: 6144
+
+# ============================================================================
+# Resources
+# ============================================================================
+Resources:
+  # --------------------------------------------------------------------------
+  # DynamoDB — Process Configuration (PK: process)
+  # --------------------------------------------------------------------------
+  ProcessConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub EnFin_AI_Document_Extraction_Config_${Environment}
+      AttributeDefinitions:
+        - AttributeName: process
+          AttributeType: S
+      KeySchema:
+        - AttributeName: process
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: document-extraction
+
+  # --------------------------------------------------------------------------
+  # DynamoDB — File State Table (PK: path, SK: process)
+  # File-level tracking: state, extraction results, SF response
+  # Composite key allows same file processed by different processes
+  # --------------------------------------------------------------------------
+  ResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub EnFin_AI_Document_Extraction_${Environment}
+      AttributeDefinitions:
+        - AttributeName: path
+          AttributeType: S
+        - AttributeName: process
+          AttributeType: S
+        - AttributeName: app_no
+          AttributeType: S
+        - AttributeName: submission_timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: path
+          KeyType: HASH
+        - AttributeName: process
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: app_no-process-index
+          KeySchema:
+            - AttributeName: app_no
+              KeyType: HASH
+            - AttributeName: process
+              KeyType: RANGE
+            - AttributeName: submission_timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: document-extraction
+
+  # --------------------------------------------------------------------------
+  # Bedrock Prompts for M0 Utility Bill Extraction
+  # --------------------------------------------------------------------------
+  M0UtilityBillPromptV1:
+    Type: AWS::Bedrock::Prompt
+    Properties:
+      Name: !Sub EnFin-M0-Utility-Bill-${Environment}
+      Description: Prompt for M0 Utility Bill extraction with field details
+      DefaultVariant: default
+      Variants:
+        - Name: default
+          TemplateType: TEXT
+          ModelId: !Ref ExtractionModel
+          TemplateConfiguration:
+            Text:
+              Text: |
+                The page images of the utility bill document are provided above.
+
+                ## DOCUMENT TEXT (Extracted by Docling - format-preserving, high accuracy for text/numbers): {{docling_text}}
+
+                <persona>
+                You are an expert OCR extractor, capable of extracting information from pdf, images clearly and distinctly.
+                </persona>
+
+                <goal>
+                Your goal is to analyze the document, check whether it is a utility bill or not, if utility bill then provide as much information as you got from the document, as per the <output>.
+                </goal>
+
+                <task>
+                You are analyzing a utility bill document. You have TWO sources of information:
+                1. **Page Images** (above) - Use these to detect layout, identify sections, logos, and locate where each field is on the page and visual reading for exact digits and characters.
+                2. **Docling Text** (above) - Use this for the exact text values. Docling text is MORE RELIABLE than visual reading for exact digits and characters.
+
+                You can be provided with other language utility bill also (e.g. Spanish), you have to decode the language, and understand the meaning of that and properly fill the value with that of our requirement.
+                </task>
+
+                <information>
+                Utility Bill is a monthly invoice or statement outlining charges for essential household services. This could include water bill, electricity bill, gas bill, or any document which is provided by public utility companies.
+                </information>
+
+                <guardrails>
+                - If for any field you are not able to find the value exactly, then leave that field as empty
+                - Do not create any kind of data by yourself, ONLY provide what is there in the document
+                </guardrails>
+
+                <steps_to_follow>
+                ## STEP 1: IDENTIFY THE UTILITY PROVIDER
+                Examine the page images for logos, headers, and contact information.
+
+                ### KNOWN UTILITIES:
+                - **California**: PG&E (Pacific Gas & Electric), SCE (Southern California Edison), SDG&E (San Diego Gas & Electric)
+                - **Illinois**: ComED (Commonwealth Edison), Ameren Illinois
+                - **Luma**: LUMA energy
+
+                If the document is NOT a utility bill, set utility_provider to "Not_Utility_Bill" or the utility name and return empty fields.
+
+                ## STEP 2: EXTRACT REQUIRED FIELDS
+                Based on the identified utility, extract the required fields.
+
+                {{field_details}}
+
+                ## EXTRACTION PROCESS:
+                For EACH required field:
+                1. **Visual Location**: Use the page images to identify WHERE the field is (which page, which section, near which label)
+                2. **Return value**: Return the required field values by cross-referencing with the document text
+                </steps_to_follow>
+
+                <reasoning>
+                **Field-by-Field Extraction**:
+                For each field:
+                1. Visual: I see [field label] on page [N] in section [section]. The value appears to be [visual_value].
+                2. Keywords: Any keywords present near which confirms the value
+                3. Docling: Searching Docling text near [label]... Found: [docling_value]
+                4. Cross-check: Visual=[visual_value], Docling=[docling_value] -> [match/mismatch]
+                5. Final value: [value](source: docling/visual)
+                6. Assess if final value matches description of the field and proceed to Confidence Assessment
+
+                **Confidence Assessment**:
+                - CERTAIN: Value found in both docling_text and document image confidently along with keywords which confirms it and is consistent/ same across docling_text and document image
+                - LIKELY: Value found but not consistent across docling_text and document image but matching keywords/description and format
+                - UNCERTAIN: Value found but not consistent across docling_text and not confident based on keywords/description and format or format
+                - NOT_FOUND: Could not locate value
+                </reasoning>
+
+                <output>
+                {
+                  "is_supported_document": true|false,
+                  "no_relevant_pages_reason": null,
+                  "fields": {
+                    "field_name": {
+                      "value": "extracted_value_or_null",
+                      "page": page_number,
+                      "section": "section/label where found",
+                      "confidence": "CERTAIN|LIKELY|UNCERTAIN|NOT_FOUND",
+                      "reasoning": "brief explanation"
+                    }
+                  }
+                }
+                </output>
+
+  # --------------------------------------------------------------------------
+  # Input SQS Queue (FIFO) — triggers extraction Lambda
+  # --------------------------------------------------------------------------
+  InputQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub EnFin_AI_Document_Extraction_Input_${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      DeduplicationScope: messageGroup
+      FifoThroughputLimit: perMessageGroupId
+      VisibilityTimeout: 720
+      MessageRetentionPeriod: 604800
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt InputDLQ.Arn
+        maxReceiveCount: 3
+
+  InputDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub EnFin_AI_Document_Extraction_Input_DLQ_${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: 1209600
+
+  # --------------------------------------------------------------------------
+  # Salesforce Output Queue (FIFO) — triggers SF push Lambda
+  # --------------------------------------------------------------------------
+  SalesforceOutputQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub EnFin_AI_Document_Extraction_SF_Output_${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      DeduplicationScope: messageGroup
+      FifoThroughputLimit: perMessageGroupId
+      VisibilityTimeout: 900
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SalesforceOutputDLQ.Arn
+        maxReceiveCount: 3
+
+  SalesforceOutputDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub EnFin_AI_Document_Extraction_SF_Output_DLQ_${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: 1209600
+
+  # --------------------------------------------------------------------------
+  # Aggregation Input SQS Queue (FIFO) — triggers aggregation Lambda
+  # --------------------------------------------------------------------------
+  AggregationInputQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub EnFin_AI_Document_Extraction_Aggregation_Input_${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      DeduplicationScope: messageGroup
+      FifoThroughputLimit: perMessageGroupId
+      DelaySeconds: 600
+      VisibilityTimeout: 900
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AggregationInputDLQ.Arn
+        maxReceiveCount: 3
+
+  AggregationInputDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub EnFin_AI_Document_Extraction_Aggregation_Input_DLQ_${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: 1209600
+
+  # --------------------------------------------------------------------------
+  # Extraction Lambda (Docker Container)
+  # --------------------------------------------------------------------------
+  ExtractionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EnFin_AI_Document_Extraction_${Environment}
+      PackageType: Image
+      Description: Configurable document extraction — Docling + LLM (Bedrock Converse)
+      ImageConfig:
+        Command: ["lambda_function.lambda_handler"]
+      EphemeralStorage:
+        Size: 4096
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+          S3_BUCKET: !Ref S3BucketName
+
+          # DynamoDB tables
+          DYNAMODB_CONFIG_TABLE: !Ref ProcessConfigTable
+          DYNAMODB_EXTRACTION_TABLE: !Ref ResultsTable
+
+          # Model
+          EXTRACTION_MODEL: !Ref ExtractionModel
+          MODEL_MAX_TOKENS: !Ref ModelMaxTokens
+          MODEL_TEMPERATURE: !Ref ModelTemperature
+          MAX_IMAGES_PER_LLM_CALL: !Ref MaxImagesPerLLMCall
+
+          # OCR
+          OCR_ENGINE: !Ref OCREngine
+          OCR_LANG: !Ref OCRLang
+          FORCE_OCR: !Ref ForceOCR
+
+          # Image
+          PDF_IMAGE_DPI: !Ref PDFImageDPI
+          MAX_IMAGE_DIMENSION: !Ref MaxImageDimension
+
+          # Confidence
+          AUTO_ACCEPT_THRESHOLD: !Ref AutoAcceptThreshold
+          FLAG_THRESHOLD: !Ref FlagThreshold
+
+          # Timezone
+          TIMEZONE: !Ref Timezone
+          TIMESTAMP_FORMAT: !Ref TimestampFormat
+
+          # Config cache
+          CONFIG_CACHE_TTL_SECONDS: !Ref ConfigCacheTTLSeconds
+
+          # Salesforce (per-file push)
+          SF_ENABLED: !Ref SalesforceEnabled
+          SF_HOST: !Ref SalesforceHost
+          SF_INSTANCE_URL: !Ref SalesforceInstanceUrl
+          SF_USERNAME: !Ref SalesforceUsername
+          SF_SECRET_NAME: !Ref SalesforceSecretName
+          SF_TOKEN_TABLE: !Ref SalesforceTokenTableName
+          SF_APEX_PATH: !Ref SalesforceApexPath
+          SF_TOKEN_DIFF_TIME: !Ref SalesforceDiffTime
+          SF_AUTH_PATH: !Ref SalesforceAuthPath
+
+          # Output SQS queue for Salesforce push
+          OUTPUT_SQS_QUEUE_URL: !Ref SalesforceOutputQueue
+
+          # Aggregation layer
+          AGGREGATION_ENABLED: !Ref AggregationEnabled
+          AGGREGATION_SQS_QUEUE_URL: !Ref AggregationInputQueue
+
+          # Logging
+          LOG_LEVEL: !Ref LogLevel
+
+          # Normalization rule replacements
+          NORMALIZATION_RULE_REPLACEMENTS: !Ref NomalizationRuleReplacements
+
+          BDA_PROFILE_ARN: !Ref BDAProfileArn
+
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:ListObject
+                - s3:PutObject           # <-- (needed for BDA output)
+                - s3:ListBucket          # (see note below)
+              Resource:
+                - !Sub arn:aws:s3:::${S3BucketName}/*
+                - !Sub arn:aws:s3:::${S3BucketName}        # <-- add (ListBucket is bucket-level)
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+              Resource:
+                - !GetAtt ProcessConfigTable.Arn
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*"
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:GetPrompt
+                - bedrock:InvokeDataAutomationAsync
+                - bedrock:GetDataAutomationStatus
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - textract:AnalyzeDocument
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - sqs:SendMessage
+                - sqs:GetQueueAttributes
+              Resource:
+                - !GetAtt SalesforceOutputQueue.Arn
+                - !GetAtt AggregationInputQueue.Arn
+
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt InputQueue.Arn
+            BatchSize: 1
+
+    Metadata:
+      DockerTag: latest
+      DockerContext: .
+      Dockerfile: Dockerfile
+
+# ----------------------------------------------------------------------
+  # BDA Result Handler Lambda — triggered by S3 when BDA writes result.json
+  # Uses the same container image as ExtractionFunction but a different
+  # handler, so no new build artifact is needed.
+  # S3 trigger is wired manually in the Console (bucket is external to
+  # this template). BDAResultHandlerS3Permission grants S3 invoke rights.
+  # ----------------------------------------------------------------------
+  BDAResultHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "EnFin_AI_BDA_Result_Handler_${Environment}"
+      Description: Picks up BDA result.json from S3 and completes extraction flow
+      PackageType: Image
+      ImageConfig:
+        Command:
+          - "lambda_function.bda_result_handler"
+      Timeout: 60
+      MemorySize: 1024
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+          S3_BUCKET: !Ref S3BucketName
+          DYNAMODB_CONFIG_TABLE: !Ref ProcessConfigTable
+          DYNAMODB_EXTRACTION_TABLE: !Ref ResultsTable
+          OUTPUT_SQS_QUEUE_URL: !Ref SalesforceOutputQueue
+          AGGREGATION_SQS_QUEUE_URL: !Ref AggregationInputQueue
+          SF_ENABLED: !Ref SalesforceEnabled
+          AGGREGATION_ENABLED: !Ref AggregationEnabled
+          TIMEZONE: !Ref Timezone
+          TIMESTAMP_FORMAT: !Ref TimestampFormat
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !Ref LogLevel
+          CONFIG_CACHE_TTL_SECONDS: !Ref ConfigCacheTTLSeconds
+
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:ListBucket
+              Resource:
+                - !Sub arn:aws:s3:::${S3BucketName}/*
+                - !Sub arn:aws:s3:::${S3BucketName}
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+              Resource:
+                - !GetAtt ProcessConfigTable.Arn
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*"
+            - Effect: Allow
+              Action:
+                - sqs:SendMessage
+                - sqs:GetQueueAttributes
+              Resource:
+                - !GetAtt SalesforceOutputQueue.Arn
+                - !GetAtt AggregationInputQueue.Arn
+
+    Metadata:
+      DockerTag: latest
+      DockerContext: .
+      Dockerfile: Dockerfile
+
+  # Grants S3 permission to invoke the BDA Result Handler Lambda.
+  # The actual notification is configured manually in the S3 Console
+  # because the bucket is managed outside this template.
+  BDAResultHandlerS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt BDAResultHandlerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:aws:s3:::${S3BucketName}
+
+  # --------------------------------------------------------------------------
+  # Salesforce Push Lambda (Standalone Python - No Docker)
+  # --------------------------------------------------------------------------
+  SalesforcePushFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EnFin_AI_Document_Extraction_SF_Push_${Environment}
+      Runtime: python3.11
+      Handler: sf_push_lambda.lambda_handler
+      CodeUri: EnFin_SF_Push/
+      Description: Salesforce push handler for document extraction (standalone, reusable)
+      Timeout: 300
+      MemorySize: 128
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+
+          # DynamoDB tables
+          DYNAMODB_CONFIG_TABLE: !Ref ProcessConfigTable
+          DYNAMODB_EXTRACTION_TABLE: !Ref ResultsTable
+
+          # Salesforce configuration (reuse from extraction Lambda)
+          SF_ENABLED: !Ref SalesforceEnabled
+          SF_HOST: !Ref SalesforceHost
+          SF_INSTANCE_URL: !Ref SalesforceInstanceUrl
+          SF_USERNAME: !Ref SalesforceUsername
+          SF_SECRET_NAME: !Ref SalesforceSecretName
+          SF_TOKEN_TABLE: !Ref SalesforceTokenTableName
+          SF_APEX_PATH: !Ref SalesforceApexPath
+          SF_TOKEN_DIFF_TIME: !Ref SalesforceDiffTime
+          SF_AUTH_PATH: !Ref SalesforceAuthPath
+
+          # Logging
+          LOG_LEVEL: !Ref LogLevel
+
+      Policies:
+        - Statement:
+            # CloudWatch Logs
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: "*"
+
+            # DynamoDB - Read/Update file state
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+                - dynamodb:PutItem
+              Resource: "*"
+
+            # Secrets Manager - Get SF credentials
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: "*"
+
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SalesforceOutputQueue.Arn
+            BatchSize: 1
+            Enabled: true
+
+  # --------------------------------------------------------------------------
+  # Aggregation Lambda (Standalone Python - No Docker)
+  # --------------------------------------------------------------------------
+  AggregationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub EnFin_AI_Extraction_Aggregation_Handler_${Environment}
+      Runtime: python3.11
+      Handler: aggregation_lambda.lambda_handler
+      CodeUri: EnFin_AI_Extraction_Aggregation_Handler/
+      Description: Aggregation handler — aggregates per-file extractions, detects conflicts, pushes to SF
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+
+          # DynamoDB tables
+          DYNAMODB_CONFIG_TABLE: !Ref ProcessConfigTable
+          DYNAMODB_EXTRACTION_TABLE: !Ref ResultsTable
+
+          # Config cache
+          CONFIG_CACHE_TTL_SECONDS: !Ref ConfigCacheTTLSeconds
+
+          # Salesforce configuration (reuse from extraction Lambda)
+          SF_ENABLED: !Ref SalesforceEnabled
+          SF_HOST: !Ref SalesforceHost
+          SF_INSTANCE_URL: !Ref SalesforceInstanceUrl
+          SF_USERNAME: !Ref SalesforceUsername
+          SF_SECRET_NAME: !Ref SalesforceSecretName
+          SF_TOKEN_TABLE: !Ref SalesforceTokenTableName
+          SF_APEX_PATH: !Ref SalesforceApexPath
+          SF_TOKEN_DIFF_TIME: !Ref SalesforceDiffTime
+          SF_AUTH_PATH: !Ref SalesforceAuthPath
+
+          # Logging
+          LOG_LEVEL: !Ref LogLevel
+
+      Policies:
+        - Statement:
+            # CloudWatch Logs
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: "*"
+
+            # DynamoDB - Read config + Read/Update extraction results
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+                - dynamodb:PutItem
+              Resource: "*"
+
+            # Secrets Manager - Get SF credentials
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: "*"
+
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AggregationInputQueue.Arn
+            BatchSize: 1
+            Enabled: true
+
+# ============================================================================
+# Outputs
+# ============================================================================
+Outputs:
+  InputQueueUrl:
+    Description: URL of the input SQS queue
+    Value: !Ref InputQueue
+
+  InputQueueArn:
+    Description: ARN of the input SQS queue
+    Value: !GetAtt InputQueue.Arn
+
+  InputDLQUrl:
+    Description: URL of the input Dead Letter Queue
+    Value: !Ref InputDLQ
+
+  ExtractionFunctionArn:
+    Description: ARN of the extraction Lambda (file-level processing with immediate SF push)
+    Value: !GetAtt ExtractionFunction.Arn
+
+  ConfigTableName:
+    Description: DynamoDB config table name
+    Value: !Ref ProcessConfigTable
+
+  ResultsTableName:
+    Description: DynamoDB file state tracking table name (path as PK)
+    Value: !Ref ResultsTable
+
+  M0UtilityBillPromptV1Arn:
+    Description: ARN of M0 Utility Bill Prompt Version 1
+    Value: !GetAtt M0UtilityBillPromptV1.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-M0PromptV1Arn
+
+  SalesforceOutputQueueUrl:
+    Description: URL of the Salesforce output SQS queue
+    Value: !Ref SalesforceOutputQueue
+    Export:
+      Name: !Sub ${AWS::StackName}-SF-Output-Queue-URL
+
+  SalesforceOutputQueueArn:
+    Description: ARN of the Salesforce output SQS queue
+    Value: !GetAtt SalesforceOutputQueue.Arn
+
+  SalesforcePushFunctionArn:
+    Description: ARN of the Salesforce push Lambda
+    Value: !GetAtt SalesforcePushFunction.Arn
+
+  SalesforceOutputDLQUrl:
+    Description: URL of the Salesforce output DLQ
+    Value: !Ref SalesforceOutputDLQ
+
+  AggregationInputQueueUrl:
+    Description: URL of the aggregation input SQS queue
+    Value: !Ref AggregationInputQueue
+
+  AggregationInputQueueArn:
+    Description: ARN of the aggregation input SQS queue
+    Value: !GetAtt AggregationInputQueue.Arn
+
+  AggregationInputDLQUrl:
+    Description: URL of the aggregation input DLQ
+    Value: !Ref AggregationInputDLQ
+
+  AggregationFunctionArn:
+    Description: ARN of the aggregation Lambda
+    Value: !GetAtt AggregationFunction.Arn
